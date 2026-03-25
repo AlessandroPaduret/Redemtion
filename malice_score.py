@@ -54,7 +54,11 @@ class Redemption:
         extension_writes = self.extension_writes(r)
         feature.append(extension_writes)
 
-        return self.score(r)
+        # calcoliamo r6 formula: r6 = 1/dt dove dt è il tempo trascorso tra l'ultima operazione di scrittura su un file e l'operazione di scrittura corrente su quel file, se il file è lo stesso
+        r6 = self.dt(r)
+        feature.append(r6)
+
+        return self.score(feature)
 
     def entropy_ratio(self, current_op: dict) -> float:
         """
@@ -187,3 +191,39 @@ class Redemption:
         if parsed_path in self.file_writes:
             return 1 - 1/(1 + len(self.file_writes[parsed_path]))
         return 0
+
+    def update_extension_writes(self, r: dict):
+        """
+        Extension of File Writes. Redemption monitors the file extensions of the user files that a process writes to. In a typical ransomware attack, the malicious process writes to user files with specific extensions (e.g., .doc, .xls, .pdf) to encrypt them. Our system increases the malice score of a process as the process writes to user files with different extensions. In fact, a process is assigned a higher malice score if it writes to user files with many different extensions.
+        """
+        if r['major'] == 'IRP_MJ_WRITE':
+            extension = r['dest_path'].split('.')[-1]
+            if extension not in self.extension_writes:
+                self.extension_writes[extension] = 0
+            if len(self.extension_writes) < 2: # se abbiamo già scritto su 2 estensioni diverse non ci interessa più aggiornare questa feature
+                self.extension_writes.append(extension)
+    
+    def extension_writes(self, r: dict):
+        """
+        Given a set of document classes, Redemption monitors whether the pro-
+        cess requests write access to files that belong to different document classes. The
+        file A and file B belong to two different document classes if the program that
+        opens file A cannot take file B as a valid input. For example, a docx and a
+        pdf file belong to two different document classes since a docx file cannot be
+        opened via a PDF editor program. We assign the score 1 if the process performs
+        cross-document access requests similar to ransomware.
+        """
+        # formula: 
+        return 1 if len(self.extension_writes) > 1 else 0
+
+    def dt(self, r: dict):
+        """
+        calcoliamo il tempo trascorso tra l'ultima operazione e r
+        """
+        if self.last_time is None:
+            self.last_time = r['time']
+            return 0
+        else:
+            dt = r['time'] - self.last_time
+            self.last_time = r['time']
+            return 1/dt if dt > 0 else 0

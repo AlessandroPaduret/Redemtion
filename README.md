@@ -16,3 +16,4 @@ TODO:
 CONSIGLI:
 - catturare scritture sequenziali
 - catturare % di file sovrescritti
+- extensioni dei file scritti è un po' scarna
