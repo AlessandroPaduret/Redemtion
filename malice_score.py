@@ -1,229 +1,366 @@
+"""
+redemption.py
+─────────────
+Implementazione allenabile di Redemption (Kharraz et al., 2017) come nn.Module.
 
-def malice_score(weighs: dict, r: dict) -> int:
+Architettura:
+  - Feature extractor  : stateful, basato su regole, opera su singoli eventi IRP
+  - Classificatore     : nn.Linear(6, 1) allenabile, combina le 6 feature
 
-    score = 0
-    for i in range(1,6):
-        score += weighs[i] * r[i]
-    
-    return score
+Le 6 feature (tutte ∈ [0, 1]):
+  f1  Entropy Ratio          – aumento di entropia tra lettura e scrittura sullo stesso offset
+  f2  File Overwrite         – frazione del contenuto del file sovrascritto
+  f3  File Deletion          – richiesta di cancellazione (0/1)
+  f4  Sequential Writes      – scritture sequenziali su directory già esplorate
+  f5  Cross-class Writes     – scritture su almeno 2 estensioni diverse (0/1)
+  f6  Write Frequency        – 1/dt tra eventi consecutivi (normalizzato)
 
-# Gli oggetti di tipo redempion possono calcolare il malice score
-# Questi oggetti "mangiano" righe di log restituire da parser.py calcola le feature e restituiscono un malice score
-# il problema è che le feature non sono stateless ma dipendono dalle operazioni precedenti
+Utilizzo tipico:
+  model = Redemption()
+  features = model.process_pid(rows)          # (N, 6) — feature extraction
+  logits   = model(features)                  # (N, 1) — classificazione
+  loss     = nn.BCEWithLogitsLoss()(logits.squeeze(), labels)
+"""
 
-class Redemption:
-    
-    def __init__(self, weighs: dict):
-        self.weighs = weighs
-        self.read_operations = {} # chiave: file_name + file_offset, valore: entropia dell'ultima operazione di lettura su quel file offset
-        self.file_writes = {} # chiave: file_name, valore: set di buffer unici scritti su quel file (identificati dall'offset)
-        self.file_dimensions = {} # chiave: file_name, valore: dimensione del file iniziale
+from __future__ import annotations
 
-    
-    def score(self, r: dict) -> int:
-        return malice_score(self.weighs, r)
-    
-    def get(self, r: dict) -> int:
+from typing import Optional
+import torch
+import torch.nn as nn
+
+
+# ══════════════════════════════════════════════════════════════════
+#  MODELLO
+# ══════════════════════════════════════════════════════════════════
+
+class Redemption(nn.Module):
+    """
+    Wrapper nn.Module che separa l'estrazione di feature (stateful, basata su
+    regole) dalla combinazione lineare allenabile.
+
+    Lo stato interno viene resettato per ogni nuovo PID tramite reset_state().
+    """
+
+    N_FEATURES = 6
+
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(self.N_FEATURES, 1)
+        self._reset_state()
+
+    # ── State management ────────────────────────────────────────
+
+    def _reset_state(self):
+        """Azzera lo stato accumulato; da chiamare all'inizio di ogni nuovo PID."""
+
+        # f1: ultima entropia di lettura indicizzata da "(dest_path, offset)"
+        self._read_entropy: dict[str, float] = {}
+
+        # f2: stato scritture per file
+        #   dest_path → {'initial_size': int, 'written': dict[offset, buf_size]}
+        #   Usiamo offset come chiave per evitare di contare due volte la stessa zona.
+        self._file_write_state: dict[str, dict] = {}
+
+        # f4: directory già esplorate (da DIRECTORY_CONTROL / QUERY_DIRECTORY)
+        self._discovered_paths: set[str] = set()
+        # f4: file unici scritti per ogni parent directory
+        self._path_writes: dict[str, set] = {}
+
+        # f5: estensioni su cui il processo ha scritto
+        self._written_extensions: set[str] = set()
+
+        # f6: timestamp dell'ultimo evento (oggetto datetime o float)
+        self._last_time: Optional[object] = None
+
+    # ── nn.Module forward ────────────────────────────────────────
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
         """
-        il malice score viene calcolato a partire dall'input e da alcune feature che dipendono dalle operazioni precedenti
-        quindi trattiamo l'input come stream e aggiorniamo le feature che dipendono dalle operazioni precedenti ogni volta che leggiamo una nuova riga di log
-        Input: riga di log (r) con i campi necessari per updatare le feature e calcolare il malice score
-        Output: malice score calcolato a partire dall'input e dalle feature aggiornate
-        """
-        feature = []
-        # calcolo entropy ratio e aggiorno le operazioni di lettura
-        self.update_read_operations(r)
-        ratio = self.entropy_ratio(r)
-        feature.append(ratio)
+        Applica il classificatore lineare alle feature già estratte.
 
-        # calcolo file overwrite e aggiorno le operazioni di scrittura
-        self.update_file_overwrite(r)
-        overwrite = self.file_overwrite(r)
-        feature.append(overwrite)
-
-        # calcolo delete operations 1 se delete è true, 0 altrimenti
-        feature.append(1 if r['major'] == 'IRP_MJ_SET_INFORMATION' and r['fileinfoclass'] == 'FileDispositionInformation' and r['delete'] == True else 0)
-
-        # calcolo file sequential writes e aggiorno le operazioni di scrittura
-        self.update_file_sequential_writes(r)
-        sequential_writes = self.file_sequential_writes(r)
-        feature.append(sequential_writes)
-
-        # calcolo di quante estensioni di file diversi ha scritto un certo pid(assumo che loggo il log di un pid alla volta)
-        self.update_extension_writes(r)
-        extension_writes = self.extension_writes(r)
-        feature.append(extension_writes)
-
-        # calcoliamo r6 formula: r6 = 1/dt dove dt è il tempo trascorso tra l'ultima operazione di scrittura su un file e l'operazione di scrittura corrente su quel file, se il file è lo stesso
-        r6 = self.dt(r)
-        feature.append(r6)
-
-        return self.score(feature)
-
-    def entropy_ratio(self, current_op: dict) -> float:
+        Args:
+            features: Tensor (N, 6)
+        Returns:
+            logit: Tensor (N, 1)  → usare con BCEWithLogitsLoss
         """
-        Entropy Ratio of Data Blocks. For every read and write request to a file,
-        Redemption computes the entropy of the corresponding data buffers in
-        the I/O traces similar to. Comparing the entropy of read and write requests
-        to and from the same file offset serves as an excellent indicator of ransomware
-        behavior. This is due to the popular strategy of reading in the original file data,
-        encrypting it, and writing the encrypted version.
-        
-        The process that changes the entropy of the data blocks between a read
-        and a write request to a higher value receives a higher malice score. The required
-        value is calculated as an additive inverse of the entropy value of read and write
-        ratio, and resides on [0,1], meaning that the higher the value of entropy in the
-        write operation, the closer the value of the entropy to 1. If the entropy of the
-        data block in write is smaller than the read operation, we assign the value 0 to
-        this feature.
-        """
-        if len(self.read_operations) == 0:
-            return 0
-        
-        # calcoliamo l'entropy ratio come il rapporto tra l'entropia dell ultima operazione di lettura / current_op['entropy'] per un determitato file offset e file name
-        '''
-        for op in self.read_operations:
-            if op['file_offset'] == current_op['file_offset'] and op['file_name'] == current_op['file_name']:
-                return self.last_read_entropy / current_op['entropy']
-        return 0
-        '''
-        # okk ma vorrei farlo efficiente
-        # possiamo tenere un dizionario con chiave file_name + file_offset e valore l'entropia dell'ultima operazione di lettura su quel file offset
-        # in questo modo possiamo aggiornare l'entropia dell'ultima operazione di lettura ogni volta che leggiamo una nuova riga di log e calcolare l'entropy ratio in
-        # tempo costante
-        key = current_op['dest_path'] + str(current_op['offset'])
-        if key in self.read_operations and self.read_operations[key] > current_op['entropy']:
-            return self.read_operations[key] / current_op['entropy']
-        return 0
-    
-    def update_read_operations(self, r: dict):
-        # aggiorniamo le operazioni di lettura se l'operazione corrente è una lettura
-        if r['major'] == 'IRP_MJ_READ':
-            key = r['dest_path'] + str(r['offset'])
-            self.read_operations[key] = r.get('entropy', 0)
+        return self.fc(features)
 
-    def file_overwrite(self, r: dict):
-        """
-        File Content Overwrite. Redemption monitors how a process requests write
-        access to data blocks. In a typical ransomware attack, in order to minimize the
-        chance of recovering files, the malicious process overwrites the content of the
-        user files with random data. Our system increases the malice score of a process
-        as the process requests write access to different parts of a file. In fact, a process
-        is assigned a higher malice score if it overwrites all the content of the files.
+    # ── Public API ───────────────────────────────────────────────
 
-        (r2): If a process iterates over the content of a file with write privilege, it will
-        receive a higher malice score. If the size of the file A is sA, and yA is the total
-        size of the data blocks modified by the process, the feature is calculated as yA / sA
-        where the higher the number of data blocks modified by the process, the closer
-        the value is to 1.
+    def process_pid(self, rows: list[dict], reset: bool = True) -> torch.Tensor:
         """
-        # per calcolare questa feature dobbiamo tenere traccia delle operazioni di scrittura sui file
-        # 
-        # sum (buffer unici scritti su un file) / size del file
-        # possiamo tenere un dizionario con chiave file_name e valore un set di buffer unici scritti su quel file
-        # la size del file iniziale la salviamo quando incontriamo la prima operazione di scrittura su quel file
+        Processa una sequenza di eventi IRP per un singolo PID e restituisce
+        il tensore di feature pronto per il forward pass.
 
-        sum_buffs = 0
-        for b in self.file_dimensions[r['dest_path']]:
-            sum_buffs += b["size"]
-        
-        return sum_buffs / self.file_dimensions[r['dest_path']]
+        Args:
+            rows:  lista di dict prodotti da parser.parse_line()
+            reset: se True (default), azzera lo stato interno prima di elaborare
 
-    def update_file_overwrite(self, r: dict):
+        Returns:
+            Tensor (len(rows), 6) di float32
         """
-        aggiorniamo le operazioni di scrittura se l'operazione corrente è una scrittura, salviamo l'offset e la dimensione del buffer scritto su quel file
-        se il file non è ancora stato incontrato, salviamo anche la dimensione del file iniziale per calcolare la feature file overwrite
+        if reset:
+            self._reset_state()
+        features = [self.extract_features(r) for r in rows]
+        return torch.tensor(features, dtype=torch.float32)
+
+    def extract_features(self, r: dict) -> list[float]:
         """
-        if r['major'] == 'IRP_MJ_WRITE':
-            if r['dest_path'] not in self.file_dimensions:
-                self.file_writes[r['dest_path']] = set()
-                self.file_dimensions[r['dest_path']] = r['presize']
-            # salviamo con identificatore l'offset e basta
-            self.file_dimensions[r['dest_path']].add({'offset': r['offset'], 'size': r['buffer_size']})
+        Estrae le 6 feature da un singolo evento di log e aggiorna lo stato.
+        Deve essere chiamato in ordine temporale su eventi dello stesso PID.
+
+        Returns:
+            Lista [f1, f2, f3, f4, f5, f6]
+        """
+        f1 = self._entropy_ratio(r)
+        self._update_read_entropy(r)     # aggiorniamo DOPO il calcolo: f1 confronta
+                                         # la scrittura corrente con letture passate
+
+        self._update_file_overwrite(r)
+        f2 = self._file_overwrite(r)
+
+        f3 = self._file_deletion(r)
+
+        self._update_sequential_writes(r)
+        f4 = self._sequential_writes(r)
+
+        self._update_extension_writes(r)
+        f5 = self._cross_class_writes()
+
+        f6 = self._write_frequency(r)
+
+        return [f1, f2, f3, f4, f5, f6]
+
+    # ══════════════════════════════════════════════════════════════
+    #  FEATURE 1 — Entropy Ratio
+    # ══════════════════════════════════════════════════════════════
+
+    def _entropy_ratio(self, r: dict) -> float:
+        """
+        Confronta l'entropia del buffer scritto con quella dell'ultima lettura
+        sullo stesso (dest_path, offset).  Un'entropia più alta in scrittura
+        rispetto alla lettura è il segnale classico di cifratura ransomware.
+
+        Formula: 1 - read_entropy / write_entropy  ∈ [0, 1]
+        Restituisce 0 se non è una scrittura o se non esiste una lettura precedente
+        sullo stesso offset, o se l'entropia non è aumentata.
+        """
+        if r.get('major') != 'IRP_MJ_WRITE':
+            return 0.0
+        key = f"{r.get('dest_path')}:{r.get('offset')}"
+        read_ent = self._read_entropy.get(key)
+        write_ent = r.get('entropy') or 0.0
+        if read_ent is not None and write_ent > read_ent and write_ent > 0:
+            return 1.0 - read_ent / write_ent
+        return 0.0
+
+    def _update_read_entropy(self, r: dict):
+        """Memorizza l'entropia dell'ultimo evento di lettura per (dest_path, offset)."""
+        if r.get('major') == 'IRP_MJ_READ':
+            key = f"{r.get('dest_path')}:{r.get('offset')}"
+            self._read_entropy[key] = r.get('entropy') or 0.0
+
+    # ══════════════════════════════════════════════════════════════
+    #  FEATURE 2 — File Content Overwrite
+    # ══════════════════════════════════════════════════════════════
+
+    def _file_overwrite(self, r: dict) -> float:
+        """
+        Stima la frazione del file sovrascritta dal processo.
+
+        Formula: Σ buf_size per offset unico / initial_file_size  ∈ [0, 1]
+        Un ransomware tipicamente sovrascrive l'intero contenuto prima di
+        rinominare il file con l'estensione cifrata.
+        """
+        path = r.get('dest_path')
+        state = self._file_write_state.get(path)
+        if state is None or state['initial_size'] == 0:
+            return 0.0
+        bytes_written = sum(state['written'].values())
+        return min(bytes_written / state['initial_size'], 1.0)
+
+    def _update_file_overwrite(self, r: dict):
+        """
+        Tiene traccia dei byte scritti per file, indicizzati per offset.
+        Usa l'offset come chiave così le sovrascritture sullo stesso blocco
+        non vengono contate due volte.
+        """
+        if r.get('major') != 'IRP_MJ_WRITE':
+            return
+        path = r.get('dest_path')
+        if path is None:
+            return
+        if path not in self._file_write_state:
+            self._file_write_state[path] = {
+                'initial_size': r.get('presize') or 0,
+                'written': {}      # {offset: buf_size}
+            }
+        offset = r.get('offset') or 0
+        buf_size = r.get('buffersize') or 0
+        # Sovrascrivi l'entry esistente: stessa zona, aggiornato con ultima size
+        self._file_write_state[path]['written'][offset] = buf_size
+
+    # ══════════════════════════════════════════════════════════════
+    #  FEATURE 3 — File Deletion
+    # ══════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _file_deletion(r: dict) -> float:
+        """
+        Rileva richieste esplicite di cancellazione tramite FileDispositionInformation.
+        Restituisce 1.0 se il flag 'delete' è True, 0.0 altrimenti.
+        """
+        return float(
+            r.get('major') == 'IRP_MJ_SET_INFORMATION'
+            and r.get('fileinfoclass') == 'FileDispositionInformation'
+            and r.get('delete') is True
+        )
+
+    # ══════════════════════════════════════════════════════════════
+    #  FEATURE 4 — Sequential Writes
+    # ══════════════════════════════════════════════════════════════
+
+    def _sequential_writes(self, r: dict) -> float:
+        """
+        Misura quanto il processo scrive in modo esteso su directory già esplorate.
+
+        Formula: 1 - 1 / (1 + |file unici scritti nel parent path|)  ∈ [0, 1)
+        Il valore cresce con il numero di file unici toccati nella stessa directory.
+        """
+        path = r.get('dest_path')
+        if not path:
+            return 0.0
+        parent = _parent_path(path)
+        n_files = len(self._path_writes.get(parent, ()))
+        return 1.0 - 1.0 / (1.0 + n_files) if n_files else 0.0
+
+    def _update_sequential_writes(self, r: dict):
+        """
+        Aggiorna lo stato per f4:
+        - registra la directory quando viene esplorata (QUERY_DIRECTORY)
+        - traccia i file scritti all'interno delle directory esplorate
+        """
+        major = r.get('major')
+        minor = r.get('minor')
+        path  = r.get('dest_path')
+        if not path:
+            return
+
+        if major == 'IRP_MJ_DIRECTORY_CONTROL' and minor == 'IRP_MN_QUERY_DIRECTORY':
+            self._discovered_paths.add(path)
+
+        if major == 'IRP_MJ_WRITE':
+            parent = _parent_path(path)
+            if parent in self._discovered_paths:
+                self._path_writes.setdefault(parent, set()).add(path)
+
+    # ══════════════════════════════════════════════════════════════
+    #  FEATURE 5 — Cross-class Writes
+    # ══════════════════════════════════════════════════════════════
+
+    def _cross_class_writes(self) -> float:
+        """
+        Restituisce 1.0 se il processo ha scritto su file con almeno 2 estensioni
+        diverse, 0.0 altrimenti.  Un ransomware tipicamente cifra documenti di
+        classi diverse (.docx, .pdf, .jpg, …).
+        """
+        return 1.0 if len(self._written_extensions) > 1 else 0.0
+
+    def _update_extension_writes(self, r: dict):
+        """Registra l'estensione del file di destinazione di ogni scrittura."""
+        if r.get('major') == 'IRP_MJ_WRITE':
+            path = r.get('dest_path') or ''
+            ext = path.rsplit('.', 1)[-1].lower() if '.' in path else ''
+            if ext:
+                self._written_extensions.add(ext)
+
+    # ══════════════════════════════════════════════════════════════
+    #  FEATURE 6 — Write Frequency
+    # ══════════════════════════════════════════════════════════════
+
+    def _write_frequency(self, r: dict) -> float:
+        """
+        Proxy della frequenza di I/O: 1 / dt rispetto all'evento precedente.
+        Alta frequenza indica attività intensa tipica di un'operazione di cifratura
+        massiva. Il valore è normalizzato con sigmoid per restare in [0, 1].
+
+        Restituisce 0.0 al primo evento di ogni PID.
+        """
+        t = r.get('time')
+        if t is None or self._last_time is None:
+            self._last_time = t
+            return 0.0
+        try:
+            dt = (t - self._last_time).total_seconds()
+        except (TypeError, AttributeError):
+            dt = float(t) - float(self._last_time)
+        self._last_time = t
+        if dt <= 0:
+            return 0.0
+        # sigmoid(1/dt) normalizza il valore grezzo a (0, 1)
+        raw = 1.0 / dt
+        return float(torch.sigmoid(torch.tensor(raw)).item())
 
 
-    def update_file_dim_rename(self, r: dict):
-        """
-        File Rename. Redemption monitors the file rename operations performed by a process. In a
-        typical ransomware attack, the malicious process renames the user files to make it more difficult
-        for the users to identify and recover their files. Our system increases the malice score of a
-        process as the process performs file rename operations. In fact, a process is assigned a higher
-        malice score if it renames all the files in a directory.
-        """
-        if r['major'] == 'IRP_MJ_SET_INFORMATION' and r['fileinfoclass'] == 'FileRenameInformation':
-            self.file_dimensions[r['newfilename']] = self.file_dimensions[r['dest_path']]
-            del self.file_dimensions[r['dest_path']]
+# ══════════════════════════════════════════════════════════════════
+#  UTILITY
+# ══════════════════════════════════════════════════════════════════
 
-    def update_file_sequential_writes(self, r: dict):
-        """
-        Sequential Writes. Redemption monitors the sequential write operations performed by a process. In a
-        typical ransomware attack, the malicious process writes to the user files sequentially to encrypt
-        them. Our system increases the malice score of a process as the process performs sequential write
-        operations. In fact, a process is assigned a higher malice score if it writes sequentially to all
-        the content of the files.
-        """
-        # scoperta dei path
-        if r['major'] == "IRP_MJ_DIRECTORY_CONTROL" and r["minor"] == 'IRP_MN_QUERY_DIRECTORY' and r['dest_path'] not in self.discovered_paths:
-            self.discovered_paths.add(r['dest_path'])
+def _parent_path(path: str) -> str:
+    """Restituisce il parent directory di un path Windows (\\-separato)."""
+    parts = path.split('\\')
+    return '\\'.join(parts[:-1]) if len(parts) > 1 else path
 
-        if r['major'] == 'IRP_MJ_WRITE':
-            # se il file è in uno dei path scoperti scopri quale con le regex e aggiorna le operazioni di scrittura su quel path
-            # se r['dest_path'] - ultima parte del path è in discovered_paths allora aggiorna le operazioni di scrittura su quel path
-            parsed_path = "".join(r['dest_path'].split('\\')[:-2]) # tutto tranne l'ultima parte del path
-            if parsed_path in self.discovered_paths:
-                if parsed_path not in self.file_writes:
-                    self.file_writes[parsed_path] = set()
-                self.file_writes[parsed_path].add(r['dest_path'])
 
-    def file_sequential_writes(self, r: dict):
-        """
-        Redemption monitors if the process traverses over the user files with write
-        privilege, and computes the additive inverse of the number of privileged accesses
-        to unique files in a given path. The output of the function resides on [0,1]. Given
-        a process X, the function assigns a higher malice score as X generates more write
-        requests to access files in a given path. Here, write(X, fi) is the ith independent
-        write request generated by the process X on a given file fi.
-        """
+# ══════════════════════════════════════════════════════════════════
+#  TRAINING LOOP MINIMALE
+# ══════════════════════════════════════════════════════════════════
 
-        # self.path_writes = {} # chiave: path, valore: set di file unici scritti su quel path (identificati dal file name)
-        # formula: result = 1 - 1/(1 + number of unique files written on that path)
-        parsed_path = "".join(r['dest_path'].split('\\')[:-2]) # tutto tranne l'ultima parte del path
-        if parsed_path in self.file_writes:
-            return 1 - 1/(1 + len(self.file_writes[parsed_path]))
-        return 0
+def train(pid_rows: dict[int, list[dict]], epochs: int = 20, lr: float = 1e-3):
+    """
+    Allena il modello su un dizionario {pid: [rows]} dove ogni riga ha il campo
+    'is_ransomware' (0/1).
 
-    def update_extension_writes(self, r: dict):
-        """
-        Extension of File Writes. Redemption monitors the file extensions of the user files that a process writes to. In a typical ransomware attack, the malicious process writes to user files with specific extensions (e.g., .doc, .xls, .pdf) to encrypt them. Our system increases the malice score of a process as the process writes to user files with different extensions. In fact, a process is assigned a higher malice score if it writes to user files with many different extensions.
-        """
-        if r['major'] == 'IRP_MJ_WRITE':
-            extension = r['dest_path'].split('.')[-1]
-            if extension not in self.extension_writes:
-                self.extension_writes[extension] = 0
-            if len(self.extension_writes) < 2: # se abbiamo già scritto su 2 estensioni diverse non ci interessa più aggiornare questa feature
-                self.extension_writes.append(extension)
-    
-    def extension_writes(self, r: dict):
-        """
-        Given a set of document classes, Redemption monitors whether the pro-
-        cess requests write access to files that belong to different document classes. The
-        file A and file B belong to two different document classes if the program that
-        opens file A cannot take file B as a valid input. For example, a docx and a
-        pdf file belong to two different document classes since a docx file cannot be
-        opened via a PDF editor program. We assign the score 1 if the process performs
-        cross-document access requests similar to ransomware.
-        """
-        # formula: 
-        return 1 if len(self.extension_writes) > 1 else 0
+    Args:
+        pid_rows: dict pid → lista di dict (output di parser.load_irp_log + split_by_pid)
+        epochs:   numero di epoche
+        lr:       learning rate
+    """
+    model = Redemption()
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    def dt(self, r: dict):
-        """
-        calcoliamo il tempo trascorso tra l'ultima operazione e r
-        """
-        if self.last_time is None:
-            self.last_time = r['time']
-            return 0
-        else:
-            dt = r['time'] - self.last_time
-            self.last_time = r['time']
-            return 1/dt if dt > 0 else 0
+    for epoch in range(1, epochs + 1):
+        total_loss = 0.0
+        model.train()
+
+        for pid, rows in pid_rows.items():
+            if not rows:
+                continue
+
+            features = model.process_pid(rows)              # (N, 6)
+            labels   = torch.tensor(
+                [float(r.get('is_ransomware', 0)) for r in rows],
+                dtype=torch.float32
+            )                                               # (N,)
+
+            optimizer.zero_grad()
+            logits = model(features).squeeze(-1)            # (N,)
+            loss   = criterion(logits, labels)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+        print(f"Epoch {epoch:>3}/{epochs}  loss={total_loss / max(len(pid_rows), 1):.4f}")
+
+    return model
+
+
+if __name__ == '__main__':
+    # Smoke-test: verifica che il forward pass funzioni senza errori
+    model = Redemption()
+    dummy = torch.rand(8, Redemption.N_FEATURES)   # batch di 8 campioni fittizi
+    logits = model(dummy)
+    assert logits.shape == (8, 1), f"Shape inattesa: {logits.shape}"
+    print("Smoke-test superato:", logits.shape)
+    print(model)
