@@ -12,6 +12,7 @@ cose da chiedere:
 TODO:
 - implementare tutto con polars
 - scrivere codice più carino e più efficiente possibile
+- script bash che inizializza environment, installa dipendenze, scarica dataset, ecc
 
 CONSIGLI:
 - catturare scritture sequenziali
