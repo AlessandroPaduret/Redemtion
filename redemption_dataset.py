@@ -1,41 +1,45 @@
 """
 redemption_dataset.py
 ─────────────────────
-Dataset PyTorch per il modello Redemption.
+Dataset PyTorch per Redemption con sliding window a livello di processo.
 
-Strategia:
-  Redemption è stateful: le feature di ogni evento dipendono dagli eventi
-  precedenti dello stesso PID (entropia letta, file scritti, ecc.).
-  Non possiamo mescolare eventi di PID diversi in un batch senza prima
-  estrarre le feature in ordine temporale.
+Perché sliding window e non per-evento
+───────────────────────────────────────
+Redemption classifica processi, non singole operazioni IRP.  Un processo può
+iniziare come benign e diventare ransomware a metà esecuzione (es. code
+injection).  Etichettare ogni IRP individualmente sarebbe sbagliato: l'evento
+"leggi file" ha la stessa forma prima e dopo l'injection.
 
-  Approccio in due fasi:
-    1. PRE-ESTRAZIONE (offline, in __init__)
-       Per ogni PID, si processa l'intera sequenza in ordine e si ottengono
-       i vettori di feature (N_pid, 6).  Lo stato viene resettato tra un PID
-       e l'altro.
+Approccio corretto:
+  - Finestra scorrevole di W eventi su ogni PID.
+  - Le feature vengono estratte in ordine temporale su tutti i W eventi;
+    lo stato di Redemption (entropia letta, file scritti, ecc.) si accumula
+    per l'intera finestra → il vettore dell'ULTIMO evento encode l'intera storia.
+  - La label della finestra è quella dell'ULTIMO evento: cattura il momento
+    in cui il processo diventa malevolo senza "contaminare" le finestre
+    precedenti ancora benign.
+  - Il gradiente scorre UNA SOLA VOLTA per finestra (non per ogni IRP).
 
-    2. TRAINING (online, in __getitem__)
-       Il dataset è piatto: ogni campione è una singola coppia (feature, label).
-       I DataLoader standard funzionano senza vincoli.
+Struttura del campione:
+  features : Tensor (6,)   — feature dell'ultimo evento della finestra
+  label    : Tensor scalar — is_ransomware dell'ultimo evento
 
-Suddivisione train/val:
-  La split avviene a livello di PID, non di singolo evento, per evitare
-  data-leakage (eventi dello stesso processo non devono finire in entrambi
-  i set).
+Split:
+  A livello di PID per evitare data-leakage (tutti gli eventi di un processo
+  stanno interamente in train o in val, mai in entrambi).
 """
 
 from __future__ import annotations
 
 import importlib
+import random
 from typing import Optional
 
 import torch
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader
 
-# Importiamo il nostro parser.py senza collidere col built-in 'parser'
 ps = importlib.import_module("parser")
-from malice_score import Redemption
+from redemption import Redemption
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -44,65 +48,89 @@ from malice_score import Redemption
 
 class RedemptionDataset(Dataset):
     """
-    Dataset flat: ogni campione è un singolo evento IRP con le sue 6 feature
-    e la label binaria (0 = benign, 1 = ransomware).
+    Dataset flat di finestre scorrevoli.
+
+    Per ogni PID con almeno W eventi, si generano sliding windows di ampiezza W
+    con passo STRIDE.  Per ogni finestra si processa l'intera sequenza in ordine
+    (stato Redemption resettato all'inizio di ogni finestra) e si conserva solo
+    il vettore di feature dell'ultimo evento come rappresentazione della finestra.
 
     Args:
         pid_rows:   dict {pid: list[dict]}  — output di df_to_pid_rows()
-        model:      istanza di Redemption usata solo per l'estrazione feature;
-                    i pesi del Linear non vengono toccati qui.
-        verbose:    se True, stampa un resoconto dopo la pre-estrazione.
+        window_size: W — numero di eventi per finestra
+        stride:     passo tra finestre consecutive (default = W/2, 50% overlap)
+        model:      istanza Redemption per feature extraction (pesi non modificati)
+        verbose:    stampa statistiche dopo la costruzione
     """
 
     def __init__(
         self,
         pid_rows: dict,
+        window_size: int = 50,
+        stride: Optional[int] = None,
         model: Optional[Redemption] = None,
         verbose: bool = True,
     ):
         if model is None:
             model = Redemption()
+        if stride is None:
+            stride = max(1, window_size // 2)
 
         all_features: list[torch.Tensor] = []
-        all_labels:   list[torch.Tensor] = []
+        all_labels:   list[float]        = []
 
         n_ransomware = 0
         n_benign     = 0
         skipped      = 0
 
         for pid, rows in pid_rows.items():
-            if not rows:
+            if len(rows) < window_size:
                 skipped += 1
                 continue
 
-            # Pre-estrazione: stato resettato automaticamente per ogni PID
-            features = model.process_pid(rows, reset=True)   # (N, 6)
+            # Scorriamo la sequenza del PID con la sliding window
+            for start in range(0, len(rows) - window_size + 1, stride):
+                window = rows[start : start + window_size]
 
-            labels = torch.tensor(
-                [float(r.get('is_ransomware', 0)) for r in rows],
-                dtype=torch.float32,
-            )                                                 # (N,)
+                # Resettiamo lo stato all'inizio di ogni finestra: ogni finestra
+                # è indipendente. process_pid processa i W eventi in ordine.
+                feat_seq = model.process_pid(window, reset=True)  # (W, 6)
 
-            all_features.append(features)
-            all_labels.append(labels)
+                # Prendiamo SOLO il vettore dell'ultimo passo: encode tutto
+                # l'accumulo dello stato visto nella finestra.
+                last_feat = feat_seq[-1]   # (6,)
 
-            n_ransomware += int(labels.sum().item())
-            n_benign     += int((labels == 0).sum().item())
+                # Label dell'ultimo evento: se il processo è diventato
+                # ransomware entro la fine della finestra, lo vediamo qui.
+                label = float(window[-1].get('is_ransomware', 0))
+
+                all_features.append(last_feat)
+                all_labels.append(label)
+
+                if label == 1.0:
+                    n_ransomware += 1
+                else:
+                    n_benign += 1
 
         if not all_features:
-            raise ValueError("Nessun PID valido trovato nel dataset.")
+            raise ValueError(
+                f"Nessuna finestra generata. "
+                f"Tutti i PID hanno meno di {window_size} eventi?"
+            )
 
-        # Tensori piatti: (tot_eventi, 6) e (tot_eventi,)
-        self.features = torch.cat(all_features, dim=0)
-        self.labels   = torch.cat(all_labels,   dim=0)
+        self.features = torch.stack(all_features)          # (N_windows, 6)
+        self.labels   = torch.tensor(all_labels)           # (N_windows,)
+        self.window_size = window_size
+        self.stride      = stride
 
         if verbose:
             tot = len(self.labels)
             print(
-                f"[RedemptionDataset] {tot} eventi totali"
+                f"[RedemptionDataset] {tot} finestre"
+                f" (W={window_size}, stride={stride})"
                 f" | ransomware={n_ransomware} ({100*n_ransomware/tot:.1f}%)"
                 f" | benign={n_benign} ({100*n_benign/tot:.1f}%)"
-                f" | PID skippati={skipped}"
+                f" | PID skippati (troppo corti)={skipped}"
             )
 
     # ── Dataset protocol ────────────────────────────────────────
@@ -111,12 +139,16 @@ class RedemptionDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Restituisce (feature_vector, label) per l'evento all'indice idx."""
+        """
+        Restituisce (feature_vector, label) per la finestra all'indice idx.
+        feature_vector: (6,) — vettore dell'ultimo evento della finestra
+        label:          scalar float — 0.0 o 1.0
+        """
         return self.features[idx], self.labels[idx]
 
 
 # ══════════════════════════════════════════════════════════════════
-#  SPLIT TRAIN / VAL a livello di PID
+#  SPLIT A LIVELLO DI PID
 # ══════════════════════════════════════════════════════════════════
 
 def split_pid_rows(
@@ -125,8 +157,10 @@ def split_pid_rows(
     seed: int = 42,
 ) -> tuple[dict, dict]:
     """
-    Divide il dizionario pid_rows in train e validation mantenendo interi i
-    gruppi per PID (niente data-leakage tra eventi dello stesso processo).
+    Divide pid_rows in train e validation mantenendo interi i gruppi per PID.
+
+    Splitting a livello di PID (non di evento) per evitare data-leakage:
+    eventi dello stesso processo non devono apparire in entrambi i set.
 
     Args:
         pid_rows:  dict {pid: list[dict]}
@@ -134,15 +168,13 @@ def split_pid_rows(
         seed:      seme per riproducibilità
 
     Returns:
-        train_rows, val_rows  — stessa struttura di pid_rows
+        train_rows, val_rows
     """
-    import random
-    rng = random.Random(seed)
-
+    rng  = random.Random(seed)
     pids = list(pid_rows.keys())
     rng.shuffle(pids)
 
-    n_val = max(1, int(len(pids) * val_ratio))
+    n_val      = max(1, int(len(pids) * val_ratio))
     val_pids   = set(pids[:n_val])
     train_pids = set(pids[n_val:])
 
@@ -163,30 +195,43 @@ def split_pid_rows(
 
 def make_dataloaders(
     train_rows: dict,
-    val_rows: dict,
+    val_rows:   dict,
+    window_size: int = 50,
+    stride: Optional[int] = None,
     batch_size: int = 256,
     num_workers: int = 0,
 ) -> tuple[DataLoader, DataLoader]:
     """
-    Crea i DataLoader di train e validation a partire dai pid_rows già splittati.
+    Crea i DataLoader di train e validation.
+
+    Un'unica istanza di Redemption (pesi non allenati) viene usata
+    solo per la feature extraction offline.
 
     Args:
         train_rows, val_rows: dict {pid: list[dict]}
-        batch_size:           campioni per batch
-        num_workers:          worker paralleli per il DataLoader
+        window_size:          W eventi per finestra
+        stride:               passo sliding window (default W/2)
+        batch_size:           campioni per batch durante il training
+        num_workers:          worker paralleli
 
     Returns:
         train_loader, val_loader
     """
-    shared_model = Redemption()   # usato solo per feature extraction, non allenato qui
+    extractor = Redemption()   # solo per feature extraction, non allenato qui
 
-    train_ds = RedemptionDataset(train_rows, model=shared_model, verbose=True)
-    val_ds   = RedemptionDataset(val_rows,   model=shared_model, verbose=True)
+    train_ds = RedemptionDataset(
+        train_rows, window_size=window_size, stride=stride,
+        model=extractor, verbose=True,
+    )
+    val_ds = RedemptionDataset(
+        val_rows, window_size=window_size, stride=stride,
+        model=extractor, verbose=True,
+    )
 
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
-        shuffle=True,          # mischiamo gli eventi (i PID sono già stati processati in ordine)
+        shuffle=True,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
     )
@@ -199,8 +244,8 @@ def make_dataloaders(
     )
 
     print(
-        f"[make_dataloaders] train={len(train_ds)} eventi"
-        f" | val={len(val_ds)} eventi"
+        f"[make_dataloaders] train={len(train_ds)} finestre"
+        f" | val={len(val_ds)} finestre"
         f" | batch_size={batch_size}"
     )
     return train_loader, val_loader

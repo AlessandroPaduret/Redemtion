@@ -259,7 +259,7 @@ class Redemption(nn.Module):
     # ══════════════════════════════════════════════════════════════
 
     def _cross_class_writes(self) -> float:
-        """
+        """ 1-1/1+n
         Restituisce 1.0 se il processo ha scritto su file con almeno 2 estensioni
         diverse, 0.0 altrimenti.  Un ransomware tipicamente cifra documenti di
         classi diverse (.docx, .pdf, .jpg, …).
