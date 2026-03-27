@@ -12,6 +12,15 @@ cose da chiedere:
 TODO:
 - implementare tutto con polars
 - script bash che inizializza environment, installa dipendenze, scarica dataset(online), ecc
+- implementare directory traversal non 1-1(1+n) ma file scritti / file della cartella presi da un file tipo quello in basso che si aggiorna( da mettere nel dataset principale assieme a IRP)
+```
+  files_per_directory:
+    C:\Users\giuli\Documents: 1
+    C:\Users\giuli\Documents\Companies: 1
+    C:\Users\giuli\Documents\Companies\Amazon: 6
+    C:\Users\giuli\Documents\Companies\CocaCola: 21
+    C:\Users\giuli\Documents\Companies\Facebook: 19
+```
 
 CONSIGLI:
 - catturare scritture sequenziali
