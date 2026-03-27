@@ -1,4 +1,8 @@
-
+"""
+label_irp.py
+─────────────
+scriptino per etichettare il log IRP con is_ransomware a livello di riga, basandosi sul PID.
+"""
 import pandas as pd
 
 read_csv = pd.read_csv('data/IRP/parsed_irp_log.csv')

@@ -40,7 +40,7 @@ EPOCHS     = 100
 LR         = 1e-3
 BATCH_SIZE = 256
 VAL_RATIO  = 0.2
-SEED       = 42
+SEED       = 423
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -118,7 +118,7 @@ def train_epoch(
         labels   = labels.to(device)          # (B,)
 
         optimizer.zero_grad()
-        logits = model(features).squeeze(-1)  # (B,)
+        logits = model(features).squeeze(-1)  # toglie dimensione finale (B, 1) → (B,)
         loss   = criterion(logits, labels)
         loss.backward()
         optimizer.step()
@@ -145,7 +145,7 @@ def evaluate(
         features = features.to(device)
         labels   = labels.to(device)
 
-        logits = model(features).squeeze(-1)
+        logits = model(features).squeeze(-1) # toglie dimensione finale (B, 1) → (B,)
         loss   = criterion(logits, labels)
         total_loss += loss.item() * len(labels)
 
@@ -197,7 +197,6 @@ if __name__ == '__main__':
     print()
     train_loader, val_loader = make_dataloaders(
         train_rows, val_rows,
-        # pid_rows, pid_rows,  # usa tutto per train/val (no data-leakage garantito dallo split PID)
         window_size = WINDOW_SIZE,
         stride      = STRIDE,
         batch_size  = BATCH_SIZE,
@@ -246,9 +245,9 @@ if __name__ == '__main__':
     print_metrics("Val",   m)
 
     print(
-        f"\n  Confusion matrix (val):\n"
-        f"              Pred 0    Pred 1\n"
-        f"  Actual 0  {m['tn']:>8}  {m['fp']:>8}\n"
-        f"  Actual 1  {m['fn']:>8}  {m['tp']:>8}\n"
+        f"\n  Matrice Risultati (val):\n"
+        f"             Negative  Positive\n"
+        f"  False  {m['fn']:>8}  {m['fp']:>8}\n"
+        f"  True   {m['tn']:>8}  {m['tp']:>8}\n"
     )
     print(f"Pesi salvati in {SAVE_PATH}")

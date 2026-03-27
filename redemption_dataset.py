@@ -3,7 +3,7 @@ redemption_dataset.py
 ─────────────────────
 Dataset PyTorch per Redemption con sliding window a livello di processo.
 
-Perché sliding window e non per-evento
+Perché sliding window
 ───────────────────────────────────────
 Redemption classifica processi, non singole operazioni IRP.  Un processo può
 iniziare come benign e diventare ransomware a metà esecuzione (es. code
@@ -155,6 +155,7 @@ def split_pid_rows(
     pid_rows: dict,
     val_ratio: float = 0.2,
     seed: int = 42,
+    verbose: bool = False,
 ) -> tuple[dict, dict]:
     """
     Divide pid_rows in train e validation mantenendo interi i gruppi per PID.
@@ -181,11 +182,12 @@ def split_pid_rows(
     train_rows = {p: pid_rows[p] for p in train_pids}
     val_rows   = {p: pid_rows[p] for p in val_pids}
 
-    print(
-        f"[split_pid_rows] train={len(train_rows)} PID"
-        f" | val={len(val_rows)} PID"
-        f" (val_ratio={val_ratio})"
-    )
+    if verbose:
+        print(
+            f"[split_pid_rows] train={len(train_rows)} PID"
+            f" | val={len(val_rows)} PID"
+            f" (val_ratio={val_ratio})"
+        )
     return train_rows, val_rows
 
 
@@ -200,6 +202,7 @@ def make_dataloaders(
     stride: Optional[int] = None,
     batch_size: int = 256,
     num_workers: int = 0,
+    verbose: bool = False,
 ) -> tuple[DataLoader, DataLoader]:
     """
     Crea i DataLoader di train e validation.
@@ -243,9 +246,10 @@ def make_dataloaders(
         pin_memory=torch.cuda.is_available(),
     )
 
-    print(
-        f"[make_dataloaders] train={len(train_ds)} finestre"
-        f" | val={len(val_ds)} finestre"
-        f" | batch_size={batch_size}"
-    )
+    if verbose:
+        print(
+            f"[make_dataloaders] train={len(train_ds)} finestre"
+            f" | val={len(val_ds)} finestre"
+            f" | batch_size={batch_size}"
+        )
     return train_loader, val_loader

@@ -8,12 +8,12 @@ Architettura:
   - Classificatore     : nn.Linear(6, 1) allenabile, combina le 6 feature
 
 Le 6 feature (tutte ∈ [0, 1]):
-  f1  Entropy Ratio          – aumento di entropia tra lettura e scrittura sullo stesso offset
-  f2  File Overwrite         – frazione del contenuto del file sovrascritto
-  f3  File Deletion          – richiesta di cancellazione (0/1)
-  f4  Sequential Writes      – scritture sequenziali su directory già esplorate
-  f5  Cross-class Writes     – scritture su almeno 2 estensioni diverse (0/1)
-  f6  Write Frequency        – 1/dt tra eventi consecutivi (normalizzato)
+  f1  Entropy Ratio          - aumento di entropia tra lettura e scrittura sullo stesso offset
+  f2  File Overwrite         - frazione del contenuto del file sovrascritto
+  f3  File Deletion          - richiesta di cancellazione (0/1)
+  f4  Sequential Writes      - scritture sequenziali su directory già esplorate
+  f5  Cross-class Writes     - scritture su almeno 2 estensioni diverse (0/1)
+  f6  Write Frequency        - 1/dt tra eventi consecutivi (normalizzato)
 
 Utilizzo tipico:
   model = Redemption()
@@ -57,19 +57,18 @@ class Redemption(nn.Module):
         self._read_entropy: dict[str, float] = {}
 
         # f2: stato scritture per file
-        #   dest_path → {'initial_size': int, 'written': dict[offset, buf_size]}
-        #   Usiamo offset come chiave per evitare di contare due volte la stessa zona.
         self._file_write_state: dict[str, dict] = {}
 
-        # f4: directory già esplorate (da DIRECTORY_CONTROL / QUERY_DIRECTORY)
+        # f4: directory già esplorate
         self._discovered_paths: set[str] = set()
+
         # f4: file unici scritti per ogni parent directory
         self._path_writes: dict[str, set] = {}
 
         # f5: estensioni su cui il processo ha scritto
         self._written_extensions: set[str] = set()
 
-        # f6: timestamp dell'ultimo evento (oggetto datetime o float)
+        # f6: dt
         self._last_time: Optional[object] = None
 
     # ── nn.Module forward ────────────────────────────────────────
@@ -85,7 +84,7 @@ class Redemption(nn.Module):
         """
         return self.fc(features)
 
-    # ── Public API ───────────────────────────────────────────────
+    # ── Calcolo feature ───────────────────────────────────────────────
 
     def process_pid(self, rows: list[dict], reset: bool = True) -> torch.Tensor:
         """
@@ -108,13 +107,14 @@ class Redemption(nn.Module):
         """
         Estrae le 6 feature da un singolo evento di log e aggiorna lo stato.
         Deve essere chiamato in ordine temporale su eventi dello stesso PID.
+        Aggiorno anche le strutture dati interne che permetto di calcolare 
+        le feature basate su stati precedenti
 
         Returns:
             Lista [f1, f2, f3, f4, f5, f6]
         """
         f1 = self._entropy_ratio(r)
-        self._update_read_entropy(r)     # aggiorniamo DOPO il calcolo: f1 confronta
-                                         # la scrittura corrente con letture passate
+        self._update_read_entropy(r)     
 
         self._update_file_overwrite(r)
         f2 = self._file_overwrite(r)
@@ -168,7 +168,7 @@ class Redemption(nn.Module):
         """
         Stima la frazione del file sovrascritta dal processo.
 
-        Formula: Σ buf_size per offset unico / initial_file_size  ∈ [0, 1]
+        Formula: sum ( buf_size per offset unico ) / initial_file_size  ∈ [0, 1]
         Un ransomware tipicamente sovrascrive l'intero contenuto prima di
         rinominare il file con l'estensione cifrata.
         """
@@ -271,7 +271,7 @@ class Redemption(nn.Module):
         if r.get('major') == 'IRP_MJ_WRITE':
             path = r.get('dest_path') or ''
             ext = path.rsplit('.', 1)[-1].lower() if '.' in path else ''
-            if ext:
+            if ext and len(self._written_extensions) < 2:  # non serve aggiungere se già abbiamo 2 estensioni diverse
                 self._written_extensions.add(ext)
 
     # ══════════════════════════════════════════════════════════════
@@ -327,7 +327,7 @@ def train(pid_rows: dict[int, list[dict]], epochs: int = 20, lr: float = 1e-3):
         lr:       learning rate
     """
     model = Redemption()
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.BCEWithLogitsLoss() # delego al evaluate trasformare il logid in probabilità con sigmoid (per stabilità numerica)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     for epoch in range(1, epochs + 1):
@@ -364,3 +364,7 @@ if __name__ == '__main__':
     assert logits.shape == (8, 1), f"Shape inattesa: {logits.shape}"
     print("Smoke-test superato:", logits.shape)
     print(model)
+
+# Esempio di utilizzo
+# pid_rows = {...}  # dict pid → lista di dict (output di parser.load_irp_log + split_by_pid)
+# model = train(pid_rows, epochs=10, lr=1e-3)

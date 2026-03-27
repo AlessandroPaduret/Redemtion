@@ -60,10 +60,10 @@ def parse_line(line: str) -> Optional[dict]:
     Restituisce None se la riga non è un record IRP/FIO valido.
     Input: riga di testo (con eventuale newline finale)
     Output: dict con chiavi:
-  type | time | pid | major | minor | source_path
-  presize | postsize | offset | fileinfoclass
-  filenamelength | newfilename | buffersize
-  entropy | dest_path
+        type | time | pid | major | minor | source_path
+        presize | postsize | offset | fileinfoclass
+        filenamelength | newfilename | buffersize
+        entropy | dest_path
     """
 
     line = line.strip()
@@ -154,7 +154,7 @@ def optimize_dtypes(df):
 def load_irp_mem_safe(filepath, chunk_lines=100000):
     reader = pd.read_csv(
     filepath, 
-    sep='|', # Un separatore che non usi (o metti qualcosa di improbabile)
+    sep='|', # Un separatore fittizio che non appare nei dati, per leggere tutto come una colonna "raw"
     names=['raw'], 
     header=None, 
     skiprows=1, 
@@ -170,7 +170,7 @@ def load_irp_mem_safe(filepath, chunk_lines=100000):
         # Applichi il parsing solo su questo pezzetto
         parsed_chunk = chunk['raw'].apply(parse_line).dropna()
         
-        # Trasformi subito in DataFrame e ottimizzi i tipi
+        # Trasformi subito in DataFrame e ottimizzi i tipi (riduci spazio in memoria)
         df_chunk = pd.DataFrame(list(parsed_chunk))
         df_chunk = optimize_dtypes(df_chunk) # Funzione sotto
         
@@ -247,6 +247,7 @@ EXAMPLES = [
             'dest_path': r'C:\Users\giuli\Documents\Companies\Amazon\0001.png',
         },
     ),
+    # 4) IRP_MJ_READ + IRP_MN_NORMAL (nessun campo nominato, solo bare int)
     (
         "IRP\t17:59:11:027\t03980\tIRP_MJ_READ                         \t"
         "IRP_MN_NORMAL                       \t"
@@ -262,6 +263,7 @@ EXAMPLES = [
             'dest_path': r'C:\Users\giuli\Documents\desktop.ini',
         }
     ),
+    # 5) IRP_MJ_DIRECTORY_CONTROL + IRP_MN_QUERY_DIRECTORY (FileInfoClass ma nessun campo nominato)
     (
         "IRP\t17:59:39:833\t03980\tIRP_MJ_DIRECTORY_CONTROL            \tIRP_MN_QUERY_DIRECTORY              \t"
         r"\Device\HarddiskVolume2\Windows\explorer.exe"
@@ -331,7 +333,7 @@ if __name__ == "__main__":
 
     pass
 
-    # Utilizzo reale:
+    # Esempio di utilizzo:
     # df = load_irp_log("data/IRP/out.log")
     # df = add_dt(df)
     # pid_dfs = split_by_pid(df)
