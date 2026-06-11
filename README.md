@@ -40,3 +40,19 @@ $$ TP / (TP + FN)$$
 
 F1-score: utile per bilanciare precisione e recall, soprattutto con classi sbilanciate
 $$ 2 * (Precisione * Recall) / (Precisione + Recall)$$
+
+
+# formato dei dati
+
+nella cartella data ci sono tanti file tipo questo:
+```csv
+PID,Timestamp,Path,Type,EntropyRatio,ContentOverwrite,IsDelete,DirTraversal,TypeCoverage,WriteFrequency,GroundTruth
+2136,10:50:23.915000000,c:\users\giuli\documents\documents\services\it\cybersec,IRP_MJ_DIRECTORY_CONTROL           ,0.0,0.0,false,0.0,0.0,0.0,0
+2136,10:50:23.915000000,c:\users\giuli\documents\documents\services\it\cybersec,IRP_MJ_DIRECTORY_CONTROL           ,0.0,0.0,false,0.0,0.0,0.0,0
+2136,10:50:23.915000000,c:\users\giuli\documents\documents\services\it\servers,IRP_MJ_DIRECTORY_CONTROL           ,0.0,0.0,false,0.0,0.0,0.0,0
+2136,10:50:23.915000000,c:\users\giuli\documents\documents\services\it\servers,IRP_MJ_DIRECTORY_CONTROL           ,0.0,0.0,false,0.0,0.0,0.0,0
+2136,10:50:23.915000000,c:\users\giuli\documents\documents\services\it\servers,IRP_MJ_DIRECTORY_CONTROL           ,0.0,0.0,false,0.0,0.0,0.0,0
+2136,10:50:23.915000000,c:\users\giuli\documents\documents\services\it\servers\102,IRP_MJ_DIRECTORY_CONTROL           ,0.0,0.0,false,0.0,0.0,0.0,0
+2136,10:50:23.915000000,c:\users\giuli\documents\documents\services\it\servers\102,IRP_MJ_DIRECTORY_CONTROL           ,0.0,0.0,false,0.0,0.0,0.0,0
+2136,10:50:23.915000000,c:\users\giuli\documents\documents\services\it\servers\102,IRP_MJ_DIRECTORY_CONTROL           ,0.0,0.0,false,0.0,0.0,0.0,0
+```
