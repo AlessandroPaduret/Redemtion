@@ -1,170 +1,132 @@
 """
 train.py
 ────────
-Training e valutazione di Redemption su tutti i PID del log IRP.
+Training e valutazione del modello Redemption utilizzando il nuovo
+DataLoader custom basato su Polars e padding delle sequenze.
 
 Flusso:
-  1. Carica labeled_irp.csv (label per riga)
-  2. Split train/val a livello di PID (no data-leakage)
-  3. RedemptionDataset: sliding window, label = ultimo evento della finestra
-  4. nn.Linear(6 → 1) allenato con BCEWithLogitsLoss
-  5. Valutazione: loss, accuracy, precision, recall, F1 + confusion matrix
-  6. Salva checkpoint migliore per F1
+  1. Carica i file CSV dalla cartella specificata e fa lo split train/val.
+  2. Inizializza RedemptionDataLoader (applica padding dinamico).
+  3. Modello lineare nn.Linear(6 -> 1) allenato con BCEWithLogitsLoss.
+  4. Valutazione: loss, accuracy, precision, recall, F1 + confusion matrix.
+  5. Salva i pesi del checkpoint con l'F1 score migliore.
 """
 
-import importlib
 import os
-
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
 
-ps = importlib.import_module("parser")
+# Import dai tuoi nuovi script
+from dataset import RedemptionDataLoader
 from redemption import Redemption
-from redemption_dataset import split_pid_rows, make_dataloaders
-
 
 # ══════════════════════════════════════════════════════════════════
 #  CONFIGURAZIONE
 # ══════════════════════════════════════════════════════════════════
 
-LOG_PATH       = "data/IRP/good_out.log"
-LABELED_PATH   = "data/IRP/labeled_irp.csv"
-SAVE_PATH      = "redemption_best.pt"
-RANSOMWARE_PID = "160"          # fallback se labeled_irp.csv manca
+DATA_DIR = "/home/ale/home-old/unipd/2.2/Progetto-Cyber/Progetto-Cybersecurity/data/output"  # Sostituisci con la cartella contenente i tuoi .csv
+SAVE_PATH = "redemption_best.pt"
 
-WINDOW_SIZE = 100    # W: eventi per finestra sliding
-STRIDE      = 50    # passo sliding window (50% overlap)
+# Parametri Finestra (da passare al Dataloader Polars)
+STRATEGY = "time-windows"  # "n-operations" o "time-windows"
+WINDOW_SIZE = 5  # Valido se strategy="n-operations"
+TIME_WINDOW_SECS = 10.0  # Valido se strategy="time-windows"
 
-EPOCHS     = 100
-LR         = 1e-3
-BATCH_SIZE = 256
-VAL_RATIO  = 0.2
-SEED       = 423
-
-
-# ══════════════════════════════════════════════════════════════════
-#  DATA LOADING
-# ══════════════════════════════════════════════════════════════════
-
-def load_labeled(log_path: str, labeled_path: str):
-    """
-    Carica il log IRP con label is_ransomware per riga.
-
-    Il CSV labeled ha già tutte le colonne parse + is_ransomware per ogni evento,
-    quindi leggiamo direttamente senza merge (il merge per PID perdeva le label).
-    """
-    import pandas as pd
-
-    if os.path.exists(labeled_path):
-        df = pd.read_csv(labeled_path)
-        df['pid']  = df['pid'].astype(str)
-        df['time'] = pd.to_datetime(df['time'], errors='coerce')
-
-        # Ricalcola dt per PID in ordine temporale (non salvato nel CSV)
-        df = df.sort_values(['pid', 'time'])
-        df['dt'] = (
-            df.groupby('pid')['time']
-            .diff()
-            .dt.total_seconds()
-            .fillna(0.0)
-        )
-        df['is_ransomware'] = df['is_ransomware'].fillna(0).astype(int)
-        print(f"[load_labeled] caricato {labeled_path} ({len(df)} righe)")
-    else:
-        df = ps.load_irp_log(log_path)
-        df = ps.add_dt(df)
-        df['is_ransomware'] = (df['pid'].astype(str) == RANSOMWARE_PID).astype(int)
-        n = df['is_ransomware'].sum()
-        print(
-            f"[load_labeled] WARN: {labeled_path} non trovato. "
-            f"Parsato {log_path}, label assegnata al PID={RANSOMWARE_PID} ({n} righe)."
-        )
-
-    n_r = df['is_ransomware'].sum()
-    n_b = len(df) - n_r
-    print(f"  ransomware={n_r}  benign={n_b}  PID unici={df['pid'].nunique()}\n")
-    return df
-
-
-def df_to_pid_rows(df) -> dict:
-    """
-    Converte il DataFrame in dict {pid: list[dict]}.
-    to_dict('records') produce [{col: val, ...}, ...] per ogni riga.
-    """
-    return {
-        pid: group.to_dict('records')
-        for pid, group in df.groupby('pid')
-    }
+# Iperparametri Training
+EPOCHS = 100
+LR = 1e-3
+BATCH_SIZE = 64
+VAL_RATIO = 0.2
+SEED = 42
 
 
 # ══════════════════════════════════════════════════════════════════
-#  TRAIN / EVAL
+#  TRAIN / EVAL LOOPS
 # ══════════════════════════════════════════════════════════════════
+
 
 def train_epoch(
-    model:     Redemption,
-    loader:    DataLoader,
+    model: Redemption,
+    loader: RedemptionDataLoader,
     optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
-    device:    torch.device,
+    device: torch.device,
 ) -> float:
-    """Un'epoca di training. Restituisce la loss media."""
+    """Esegue un'epoca di training e restituisce la loss media."""
     model.train()
     total_loss = 0.0
 
     for features, labels in loader:
-        features = features.to(device)        # (B, W, 6)
-        labels   = labels.to(device)          # (B,)
+        features = features.to(device)  # Forma: (Batch, Length, 6)
+        labels = labels.to(device)  # Forma: (Batch, Length)
 
         optimizer.zero_grad()
-        logits = model(features).squeeze(-1)  # toglie dimensione finale (B, 1) → (B,)
-        loss   = criterion(logits, labels)
+
+        # Il modello restituisce (Batch, Length, 1). squeeze(-1) lo fa diventare (Batch, Length)
+        logits = model(features).squeeze(-1)
+
+        # Appiattiamo i tensori a (Batch * Length) per calcolare la loss su tutti gli eventi
+        loss = criterion(logits.view(-1), labels.view(-1))
+
         loss.backward()
         optimizer.step()
 
-        total_loss += loss.item() * len(labels)
+        # Moltiplichiamo per la dimensione reale del batch per una media corretta
+        total_loss += loss.item() * features.size(0)
 
     return total_loss / len(loader.dataset)
 
 
 @torch.no_grad()
 def evaluate(
-    model:     Redemption,
-    loader:    DataLoader,
+    model: Redemption,
+    loader: RedemptionDataLoader,
     criterion: nn.Module,
-    device:    torch.device,
+    device: torch.device,
     threshold: float = 0.5,
 ) -> dict:
-    """Valuta il modello. Restituisce loss, accuracy, precision, recall, F1."""
+    """Valuta il modello e restituisce metriche chiave su tutte le predizioni appiattite."""
     model.eval()
     total_loss = 0.0
     tp = fp = tn = fn = 0
 
     for features, labels in loader:
         features = features.to(device)
-        labels   = labels.to(device)
+        labels = labels.to(device)
 
-        logits = model(features).squeeze(-1) # toglie dimensione finale (B, 1) → (B,)
-        loss   = criterion(logits, labels)
-        total_loss += loss.item() * len(labels)
+        logits = model(features).squeeze(-1)
+        loss = criterion(logits.view(-1), labels.view(-1))
+        total_loss += loss.item() * features.size(0)
 
-        preds = (torch.sigmoid(logits) >= threshold).float()
-        tp += ((preds == 1) & (labels == 1)).sum().item()
-        fp += ((preds == 1) & (labels == 0)).sum().item()
-        tn += ((preds == 0) & (labels == 0)).sum().item()
-        fn += ((preds == 0) & (labels == 1)).sum().item()
+        # Calcolo delle predizioni. Appiattiamo anche qui per le metriche
+        preds = (torch.sigmoid(logits.view(-1)) >= threshold).float()
+        lbls = labels.view(-1)
 
-    n         = len(loader.dataset)
-    accuracy  = (tp + tn) / n                         if n            else 0.0
-    precision = tp / (tp + fp)                        if (tp + fp)    else 0.0
-    recall    = tp / (tp + fn)                        if (tp + fn)    else 0.0
-    f1        = 2 * precision * recall / (precision + recall) \
-                                                       if (precision + recall) else 0.0
+        tp += ((preds == 1) & (lbls == 1)).sum().item()
+        fp += ((preds == 1) & (lbls == 0)).sum().item()
+        tn += ((preds == 0) & (lbls == 0)).sum().item()
+        fn += ((preds == 0) & (lbls == 1)).sum().item()
+
+    n = len(loader.dataset)
+    accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0.0
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if (precision + recall) > 0
+        else 0.0
+    )
+
     return {
-        'loss': total_loss / n, 'accuracy': accuracy,
-        'precision': precision, 'recall': recall, 'f1': f1,
-        'tp': tp, 'fp': fp, 'tn': tn, 'fn': fn,
+        "loss": total_loss / n if n > 0 else 0.0,
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "tp": tp,
+        "fp": fp,
+        "tn": tn,
+        "fn": fn,
     }
 
 
@@ -179,49 +141,54 @@ def print_metrics(split: str, m: dict):
 
 
 # ══════════════════════════════════════════════════════════════════
-#  MAIN
+#  MAIN RUNNER
 # ══════════════════════════════════════════════════════════════════
 
-if __name__ == '__main__':
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}\n")
+if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device in uso: {device}\n")
 
-    # ── 1. Dati ──────────────────────────────────────────────────
-    df       = load_labeled(LOG_PATH, LABELED_PATH)
-    pid_rows = df_to_pid_rows(df)
+    # ── 1. Data Loading ───────────────────────────────────────────
+    if not os.path.exists(DATA_DIR):
+        print(
+            f"Cartella dati non trovata: {DATA_DIR}. Aggiorna il percorso in CONFIGURAZIONE."
+        )
+        exit(1)
 
-    # ── 2. Split a livello di PID ────────────────────────────────
-    train_rows, val_rows = split_pid_rows(pid_rows, val_ratio=VAL_RATIO, seed=SEED)
-
-    # ── 3. Dataset e DataLoader (sliding window) ─────────────────
-    print()
-    train_loader, val_loader = make_dataloaders(
-        train_rows, val_rows,
-        window_size = WINDOW_SIZE,
-        stride      = STRIDE,
-        batch_size  = BATCH_SIZE,
+    print(f"Creazione dei DataLoader da {DATA_DIR}...")
+    train_loader, val_loader = RedemptionDataLoader.create_splits_from_folder(
+        data_dir=DATA_DIR,
+        val_ratio=VAL_RATIO,
+        batch_size=BATCH_SIZE,
+        seed=SEED,
+        strategy=STRATEGY,
+        window_size=WINDOW_SIZE,
+        time_window_secs=TIME_WINDOW_SECS,
     )
 
-    # ── 4. Modello ───────────────────────────────────────────────
+    print(f"  Dataset Train: {len(train_loader.dataset)} finestre")
+    print(f"  Dataset Val:   {len(val_loader.dataset)} finestre\n")
+
+    # ── 2. Modello, Loss e Ottimizzatore ──────────────────────────
     model = Redemption().to(device)
 
     criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=5
+        optimizer, mode="max", factor=0.5, patience=5
     )
 
-    print(f"\n{model}")
-    print(f"\nTraining: {EPOCHS} epoche | window={WINDOW_SIZE} | stride={STRIDE}\n")
+    print(f"Training Config: {EPOCHS} epoche | strategy={STRATEGY}\n")
     print(f"{'Epoch':>5}  {'TrainLoss':>9}  {'ValLoss':>7}  {'ValF1':>6}  {'LR':>8}")
     print("─" * 50)
 
     best_f1 = -1.0
 
+    # ── 3. Loop di Addestramento ──────────────────────────────────
     for epoch in range(1, EPOCHS + 1):
-        train_loss  = train_epoch(model, train_loader, optimizer, criterion, device)
+        train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
         val_metrics = evaluate(model, val_loader, criterion, device)
-        lr_now      = optimizer.param_groups[0]['lr']
+        lr_now = optimizer.param_groups[0]["lr"]
 
         print(
             f"{epoch:>5}  {train_loss:.4f}     "
@@ -230,24 +197,31 @@ if __name__ == '__main__':
             f"{lr_now:.1e}"
         )
 
-        scheduler.step(val_metrics['f1'])
+        # Aggiorna il learning rate in base all'F1 Score di validazione
+        scheduler.step(val_metrics["f1"])
 
-        if val_metrics['f1'] > best_f1:
-            best_f1 = val_metrics['f1']
+        # Salva se migliora F1
+        if val_metrics["f1"] > best_f1:
+            best_f1 = val_metrics["f1"]
             torch.save(model.state_dict(), SAVE_PATH)
 
-    # ── 5. Valutazione finale ────────────────────────────────────
+    # ── 4. Valutazione Finale ─────────────────────────────────────
     print(f"\n── Valutazione finale (miglior F1 val: {best_f1:.4f}) ──")
-    model.load_state_dict(torch.load(SAVE_PATH, map_location=device))
 
-    print_metrics("Train", evaluate(model, train_loader, criterion, device))
-    m = evaluate(model, val_loader, criterion, device)
-    print_metrics("Val",   m)
+    # Ricarica i pesi migliori
+    if os.path.exists(SAVE_PATH):
+        model.load_state_dict(torch.load(SAVE_PATH, map_location=device))
+
+    m_train = evaluate(model, train_loader, criterion, device)
+    m_val = evaluate(model, val_loader, criterion, device)
+
+    print_metrics("Train", m_train)
+    print_metrics("Val", m_val)
 
     print(
         f"\n  Matrice Risultati (val):\n"
         f"             Negative  Positive\n"
-        f"  False  {m['fn']:>8}  {m['fp']:>8}\n"
-        f"  True   {m['tn']:>8}  {m['tp']:>8}\n"
+        f"  False  {m_val['fn']:>8}  {m_val['fp']:>8}\n"
+        f"  True   {m_val['tn']:>8}  {m_val['tp']:>8}\n"
     )
-    print(f"Pesi salvati in {SAVE_PATH}")
+    print(f"Pesi salvati in: {SAVE_PATH}")
