@@ -45,6 +45,20 @@ Esempio (righe di esempio):
 
 Assicurati che i CSV abbiano l'header e che la colonna `GroundTruth` sia presente per l'allenamento.
 
+## Finestre (`STRATEGY` in `train.py`)
+
+| Strategia | Come divide i dati | Stato delle feature |
+| --- | --- | --- |
+| `n-operations` | ogni `WINDOW_SIZE` operazioni di un processo | cumulativo dall'inizio del processo |
+| `time-windows` | ogni `TIME_WINDOW_SECS` secondi dall'inizio del processo | cumulativo dall'inizio del processo |
+| `state-windows` | una finestra per ogni valore di `WindowStart` | **azzerato all'inizio di ogni finestra** |
+
+Con `n-operations` e `time-windows` le feature di Redemption sono calcolate a monte su tutto il processo: ogni finestra dipende dalle precedenti e i campioni non sono indipendenti (non IID).
+
+`state-windows` usa i CSV estratti in Progetto-Cybersecurity con il modello **"[3] Redemption a finestre di stato"** (strategia `Windowed`). Lì le feature di ogni finestra sono ricalcolate partendo da uno stato vuoto, quindi ogni finestra è un campione separato e l'SGD le può mescolare. I CSV hanno la colonna in più `WindowStart` (indice della prima operazione della finestra nel processo); se le finestre si sovrappongono la stessa operazione compare in più finestre. La `GroundTruth` resta quella del processo intero: un ransomware che ha già scritto prima della finestra resta 1.
+
+Nota: `pad_collate_fn` riempie le finestre più corte con zeri ed etichetta 0, e `train_epoch` include queste posizioni nella loss.
+
 ## Dove mettere i dati
 Copia i file CSV estratti da https://github.com/N-T-Lock/Progetto-Cybersecurity/ nella cartella `data/` (o in un'altra cartella a tua scelta). Se il progetto richiede uno specifico nome di file o percorso, adattalo di conseguenza. L'importante è che lo script `train.py` riesca a trovare e leggere i CSV.
 
@@ -65,6 +79,8 @@ project-root/
 ```bash
 uv run train.py
 ```
+(per i test: `uv run python -m unittest`)
+
 Questo avvierà il processo di training. Lo script `train.py` dovrebbe occuparsi di:
 - caricare i CSV,
 - preprocessare (es. gestione tipi, normalizzazione),
