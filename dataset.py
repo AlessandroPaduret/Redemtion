@@ -36,7 +36,7 @@ class PolarsLogProcessor:
 
     def create_windows(
         self,
-        strategy: Literal["n-operations", "time-windows"],
+        strategy: Literal["n-operations", "time-windows", "state-windows"],
         window_size: int = 5,
         time_window_secs: float = 10.0,
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
@@ -56,9 +56,18 @@ class PolarsLogProcessor:
                 pl.col("GroundTruth").cast(pl.Float32),
                 pl.col("Timestamp").str.to_time("%H:%M:%S%.f").alias("ParsedTime"),
             ]
-        ).sort(["PID", "ParsedTime"])
+        ).sort(["PID", "ParsedTime"], maintain_order=True)
 
-        if strategy == "n-operations":
+        if strategy == "state-windows":
+            # Finestre già calcolate con uno stato separato ciascuna (strategia
+            # Windowed di Progetto-Cybersecurity): una finestra = un campione.
+            if "WindowStart" not in working_df.columns:
+                raise ValueError(
+                    "state-windows richiede la colonna WindowStart "
+                    "(CSV estratti con 'Redemption a finestre di stato')"
+                )
+            working_df = working_df.with_columns(pl.col("WindowStart").alias("window_id"))
+        elif strategy == "n-operations":
             working_df = working_df.with_columns(
                 pl.int_range(0, pl.len()).over("PID").alias("op_index")
             ).with_columns((pl.col("op_index") // window_size).alias("window_id"))

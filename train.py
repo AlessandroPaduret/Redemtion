@@ -28,7 +28,7 @@ DATA_DIR = "/home/ale/home-old/unipd/2.2/Progetto-Cyber/Progetto-Cybersecurity/d
 SAVE_PATH = "redemption_best.pt"
 
 # Parametri Finestra (da passare al Dataloader Polars)
-STRATEGY = "time-windows"  # "n-operations" o "time-windows"
+STRATEGY = "time-windows"  # "n-operations", "time-windows" o "state-windows" (CSV con WindowStart)
 WINDOW_SIZE = 5  # Valido se strategy="n-operations"
 TIME_WINDOW_SECS = 10.0  # Valido se strategy="time-windows"
 
